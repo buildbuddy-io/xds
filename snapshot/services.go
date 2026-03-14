@@ -19,6 +19,7 @@ import (
 	"github.com/wongnai/xds/snapshot/apigateway"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -159,6 +160,16 @@ func kubeServicesToResources(services []*corev1.Service) []types.Resource {
 					EdsConfig: &corev3.ConfigSource{
 						ConfigSourceSpecifier: &corev3.ConfigSource_Ads{
 							Ads: &corev3.AggregatedConfigSource{},
+						},
+					},
+				},
+				// Allow more concurrent requests.
+				// The default limit is 1024 if this value not included in the policy.
+				// TODO: make this configurable
+				CircuitBreakers: &clusterv3.CircuitBreakers{
+					Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+						{
+							MaxRequests: wrapperspb.UInt32(8192),
 						},
 					},
 				},
