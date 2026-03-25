@@ -19,6 +19,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	clientfeatures "k8s.io/client-go/features"
+	clientfeaturestesting "k8s.io/client-go/features/testing"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2"
 )
@@ -246,6 +248,10 @@ func (s *XdsIntegrationTestSuite) TestApiGateway() {
 }
 
 func TestXdsIntegration(t *testing.T) {
+	// The fake clientset doesn't implement the WatchList bookmark protocol,
+	// so disable WatchListClient to use the traditional List+Watch flow.
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+
 	kube := fake.NewClientset()
 
 	testServer, stop, err := di.InitializeTestServer(t.Context(), kube, 1)
