@@ -9,13 +9,14 @@ package di
 import (
 	"context"
 	"github.com/wongnai/xds/debug"
+	"github.com/wongnai/xds/snapshot"
 	"google.golang.org/grpc"
 	"k8s.io/client-go/kubernetes"
 )
 
 // Injectors from wire.go:
 
-func InitializeServer(ctx context.Context, statsIntervalSeconds StatsIntervalSeconds) (Servers, func(), error) {
+func InitializeServer(ctx context.Context, statsIntervalSeconds StatsIntervalSeconds, subZoneLabel snapshot.SubZoneLabel) (Servers, func(), error) {
 	v := ProvideOtelGrpcServerOptions()
 	server, cleanup := ProvideGrpcServer(v)
 	config, err := ProvideClientConfig()
@@ -34,7 +35,7 @@ func InitializeServer(ctx context.Context, statsIntervalSeconds StatsIntervalSec
 		cleanup()
 		return Servers{}, nil, err
 	}
-	snapshotter, cleanup2 := ProvideSnapshotter(ctx, kubernetesInterface)
+	snapshotter, cleanup2 := ProvideSnapshotter(ctx, kubernetesInterface, subZoneLabel)
 	callbackFuncs := ProvideXdsLogger()
 	serverServer, cleanup3 := ProvideXdsServer(ctx, snapshotter, callbackFuncs)
 	sideEffectADSRegistered := ProvideSideEffectADSRegistered(server, serverServer)
@@ -76,10 +77,10 @@ func InitializeServer(ctx context.Context, statsIntervalSeconds StatsIntervalSec
 	}, nil
 }
 
-func InitializeTestServer(ctx context.Context, kubeClient kubernetes.Interface, statsIntervalSeconds StatsIntervalSeconds) (TestServer, func(), error) {
+func InitializeTestServer(ctx context.Context, kubeClient kubernetes.Interface, statsIntervalSeconds StatsIntervalSeconds, subZoneLabel snapshot.SubZoneLabel) (TestServer, func(), error) {
 	v := ProvideGrpcTestOption()
 	server, cleanup := ProvideGrpcServer(v)
-	snapshotter, cleanup2 := ProvideSnapshotter(ctx, kubeClient)
+	snapshotter, cleanup2 := ProvideSnapshotter(ctx, kubeClient, subZoneLabel)
 	callbackFuncs := ProvideXdsLogger()
 	serverServer, cleanup3 := ProvideXdsServer(ctx, snapshotter, callbackFuncs)
 	sideEffectADSRegistered := ProvideSideEffectADSRegistered(server, serverServer)
