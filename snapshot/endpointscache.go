@@ -16,29 +16,19 @@ import (
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 )
 
+// not a valid character in k8s node label values.
 const localityKeySep = "|"
 
 // localityNodeHash partitions xDS clients by (zone, sub_zone).
 type localityNodeHash struct{}
 
 func (localityNodeHash) ID(node *corev3.Node) string {
-	zone, subZone := nodeLocalityFromXds(node)
-	return zone + localityKeySep + subZone
+	return node.GetLocality().GetZone() + localityKeySep + node.GetLocality().GetSubZone()
 }
 
-func nodeLocalityFromXds(node *corev3.Node) (zone, subZone string) {
-	if node != nil && node.GetLocality() != nil {
-		zone = node.GetLocality().GetZone()
-		subZone = node.GetLocality().GetSubZone()
-	}
-	return
-}
-
-func splitLocalityKey(k string) (zone, subZone string) {
-	if idx := strings.Index(k, localityKeySep); idx >= 0 {
-		return k[:idx], k[idx+1:]
-	}
-	return k, ""
+func splitLocalityKey(k string) (string, string) {
+	zone, subZone, _ := strings.Cut(k, localityKeySep)
+	return zone, subZone
 }
 
 // endpointsCache wraps a SnapshotCache to produce per-client-locality
@@ -48,7 +38,7 @@ func splitLocalityKey(k string) (zone, subZone string) {
 type endpointsCache struct {
 	inner cache.SnapshotCache
 
-	mu              sync.RWMutex
+	mu              sync.Mutex
 	version         string
 	resourcesByType map[string][]types.Resource
 }
@@ -64,9 +54,9 @@ func newEndpointsCache() *endpointsCache {
 // default (no-locality) key.
 func (c *endpointsCache) setResources(ctx context.Context, version string, resourcesByType map[string][]types.Resource) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.version = version
 	c.resourcesByType = resourcesByType
-	c.mu.Unlock()
 
 	keys := c.inner.GetStatusKeys()
 	if !slices.Contains(keys, "") {
@@ -97,14 +87,18 @@ func (c *endpointsCache) ensureSnapshotForNode(ctx context.Context, node *corev3
 	if _, err := c.inner.GetSnapshot(key); err == nil {
 		return
 	}
-	c.mu.RLock()
-	version := c.version
-	resourcesByType := c.resourcesByType
-	c.mu.RUnlock()
-	if resourcesByType == nil {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Re-check now that we hold the lock.
+	// A concurrent setResources or ensureSnapshotForNode may have created the
+	// snapshot.
+	if _, err := c.inner.GetSnapshot(key); err == nil {
 		return
 	}
-	c.setSnapshotForKey(ctx, key, version, resourcesByType)
+	if c.resourcesByType == nil {
+		return
+	}
+	c.setSnapshotForKey(ctx, key, c.version, c.resourcesByType)
 }
 
 // resourcesForLocality returns a copy of resourcesByType where each
@@ -138,40 +132,32 @@ func resourcesForLocality(clientZone, clientSubZone string, resourcesByType map[
 
 // assignmentWithPriorities clones the input and assigns a priority to each
 // LocalityLbEndpoints group based on how closely it matches the client's
-// locality:
+// locality. xDS priorities start at 0 (most preferred):
 //
-//	score 2: group.zone == client.zone && group.sub_zone == client.sub_zone
-//	score 1: group.zone == client.zone
-//	score 0: no match (or client has no locality info)
+//	0: group.zone == client.zone && group.sub_zone == client.sub_zone
+//	1: group.zone == client.zone
+//	2: no match (or client has no locality info)
 //
-// Higher score -> lower (more preferred) priority. Empty buckets are
-// skipped so priorities stay contiguous.
+// Empty buckets are skipped so priorities stay contiguous.
 func assignmentWithPriorities(in *endpointv3.ClusterLoadAssignment, clientZone, clientSubZone string) *endpointv3.ClusterLoadAssignment {
 	out := proto.Clone(in).(*endpointv3.ClusterLoadAssignment)
 	if len(out.Endpoints) == 0 {
 		return out
 	}
-	// score -> groups at that score
-	bySort := map[int][]*endpointv3.LocalityLbEndpoints{}
-	scores := make([]int, 0, 3)
+	// matchPriority returns 0, 1, or 2; index buckets by priority directly.
+	var byPriority [3][]*endpointv3.LocalityLbEndpoints
 	for _, g := range out.Endpoints {
-		s := matchScore(g.GetLocality(), clientZone, clientSubZone)
-		if _, seen := bySort[s]; !seen {
-			scores = append(scores, s)
-		}
-		bySort[s] = append(bySort[s], g)
+		p := matchPriority(g.GetLocality(), clientZone, clientSubZone)
+		byPriority[p] = append(byPriority[p], g)
 	}
-	// Sort the scores in reverse order.
-	slices.Sort(scores)
-	slices.Reverse(scores)
 
-	// xDS priorities, on the other hand, start from 0 and go up.
-	// Clients will first try to fill backends with priority 0 before
-	// spilling to backends with a higher priority value.
 	priority := uint32(0)
 	regrouped := make([]*endpointv3.LocalityLbEndpoints, 0, len(out.Endpoints))
-	for _, s := range scores {
-		for _, g := range bySort[s] {
+	for _, bucket := range byPriority {
+		if len(bucket) == 0 {
+			continue
+		}
+		for _, g := range bucket {
 			g.Priority = priority
 			regrouped = append(regrouped, g)
 		}
@@ -181,15 +167,18 @@ func assignmentWithPriorities(in *endpointv3.ClusterLoadAssignment, clientZone, 
 	return out
 }
 
-func matchScore(loc *corev3.Locality, clientZone, clientSubZone string) int {
+// matchPriority returns the match priority between the client and locality.
+// The returned value is between 0 and 2 with 0 being the highest priority
+// (most specific match) and 2 being the lowest priority (least specific match).
+func matchPriority(loc *corev3.Locality, clientZone, clientSubZone string) int {
 	if loc == nil || clientZone == "" {
-		return 0
+		return 2
 	}
 	if loc.GetZone() == "" || loc.GetZone() != clientZone {
-		return 0
+		return 2
 	}
 	if loc.GetSubZone() != "" && clientSubZone != "" && loc.GetSubZone() == clientSubZone {
-		return 2
+		return 0
 	}
 	return 1
 }

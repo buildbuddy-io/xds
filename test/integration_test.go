@@ -427,6 +427,51 @@ func (s *XdsIntegrationTestSuite) TestLocalitySubZonePriorities() {
 	s.Equal(uint32(2), priByLoc["zone-b/rack-1"])
 }
 
+func (s *XdsIntegrationTestSuite) TestLocalityPreferenceUpdate() {
+	s.createKubeNode("up-a", "zone-a", "")
+	s.createKubeNode("up-b", "zone-b", "")
+
+	// Start with no locality annotation
+	// Endpoints should be in a single empty-locality group.
+	s.createKubeService("upsvc", "default", 50103)
+	s.createKubeEndpointWithNodes("upsvc", "default", []localityEndpoint{
+		{IP: "10.203.0.1", NodeName: "up-a"},
+		{IP: "10.203.0.2", NodeName: "up-b"},
+	}, 50103)
+
+	cla := s.fetchEDS("zone-a", "", "upsvc.default:grpc", 1)
+	s.Empty(cla.Endpoints[0].GetLocality().GetZone())
+	s.Len(cla.Endpoints[0].GetLbEndpoints(), 2)
+
+	// Add the locality annotation. Endpoints should now be split by zone.
+	updated := &test.K8SService{
+		Name:      "upsvc",
+		Namespace: "default",
+		Annotations: map[string]string{
+			snapshot.AnnotationLocalityPreference: "zone",
+		},
+		Ports: []corev1.ServicePort{{
+			Name:     "grpc",
+			Port:     50103,
+			Protocol: corev1.ProtocolTCP,
+		}},
+	}
+	err := s.kube.Tracker().Update(
+		schema.GroupVersionResource{Group: "", Version: "v1", Resource: "services"},
+		updated.AsK8S(),
+		"default",
+	)
+	s.Require().NoError(err)
+
+	cla = s.fetchEDS("zone-a", "", "upsvc.default:grpc", 2)
+	priByZone := map[string]uint32{}
+	for _, g := range cla.Endpoints {
+		priByZone[g.GetLocality().GetZone()] = g.GetPriority()
+	}
+	s.Equal(uint32(0), priByZone["zone-a"], "zone-a should be preferred for zone-a client after annotation added")
+	s.Equal(uint32(1), priByZone["zone-b"])
+}
+
 func (s *XdsIntegrationTestSuite) TestLocalityNoAnnotationNoSplit() {
 	// Without the annotation, all endpoints should land in a single
 	// empty-locality group regardless of node labels — behavior matches the

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
-	"sort"
+	"strings"
 
 	"github.com/ccoveille/go-safecast/v2"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -127,9 +127,9 @@ func (s *Snapshotter) kubeEndpointToResources(ep *corev1.Endpoints) []types.Reso
 			}
 			out = append(out, cla)
 
-			sortedAddresses := subset.Addresses
-			sort.SliceStable(sortedAddresses, func(i, j int) bool {
-				return sortedAddresses[i].IP < sortedAddresses[j].IP
+			sortedAddresses := slices.Clone(subset.Addresses)
+			slices.SortStableFunc(sortedAddresses, func(a, b corev1.EndpointAddress) int {
+				return strings.Compare(a.IP, b.IP)
 			})
 
 			portU32 := safecast.MustConvert[uint32](port.Port)

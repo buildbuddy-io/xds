@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"maps"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -64,23 +65,11 @@ func (s *nodeLocalityStore) apply(nodes []*corev1.Node) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if nodeMapsEqual(s.nodes, next) {
+	if maps.Equal(s.nodes, next) {
 		return false
 	}
 	s.nodes = next
 	s.version++
-	return true
-}
-
-func nodeMapsEqual(a, b map[string]nodeLocality) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
 	return true
 }
 
