@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -41,11 +42,22 @@ type endpointsCache struct {
 	mu              sync.Mutex
 	version         string
 	resourcesByType map[string][]types.Resource
+
+	logMu sync.Mutex
+	// Set of clusters that have been subscribed to.
+	// We log backend changes for any clusters that have been subscribed to
+	// at least once.
+	subscribed map[string]struct{}
+	// Last known backend set for a cluster.
+	// We only log when this value changes.
+	lastBackends map[string]string
 }
 
 func newEndpointsCache() *endpointsCache {
 	return &endpointsCache{
-		inner: cache.NewSnapshotCache(false, localityNodeHash{}, Logger),
+		inner:        cache.NewSnapshotCache(false, localityNodeHash{}, Logger),
+		subscribed:   make(map[string]struct{}),
+		lastBackends: make(map[string]string),
 	}
 }
 
@@ -57,6 +69,8 @@ func (c *endpointsCache) setResources(ctx context.Context, version string, resou
 	defer c.mu.Unlock()
 	c.version = version
 	c.resourcesByType = resourcesByType
+
+	c.logBackendChanges(resourcesByType)
 
 	keys := c.inner.GetStatusKeys()
 	if !slices.Contains(keys, "") {
@@ -185,18 +199,132 @@ func matchPriority(loc *corev3.Locality, clientZone, clientSubZone string) int {
 
 // CreateWatch implements cache.ConfigWatcher.
 func (c *endpointsCache) CreateWatch(request *cache.Request, sub cache.Subscription, value chan cache.Response) (func(), error) {
+	c.markSubscribed(request.GetResourceNames())
 	c.ensureSnapshotForNode(context.Background(), request.GetNode())
 	return c.inner.CreateWatch(request, sub, value)
 }
 
 // CreateDeltaWatch implements cache.ConfigWatcher.
 func (c *endpointsCache) CreateDeltaWatch(request *cache.DeltaRequest, sub cache.Subscription, value chan cache.DeltaResponse) (func(), error) {
+	c.markSubscribed(request.GetResourceNamesSubscribe())
 	c.ensureSnapshotForNode(context.Background(), request.GetNode())
 	return c.inner.CreateDeltaWatch(request, sub, value)
 }
 
 // Fetch implements cache.ConfigFetcher.
 func (c *endpointsCache) Fetch(ctx context.Context, request *cache.Request) (cache.Response, error) {
+	c.markSubscribed(request.GetResourceNames())
 	c.ensureSnapshotForNode(ctx, request.GetNode())
 	return c.inner.Fetch(ctx, request)
+}
+
+func (c *endpointsCache) GetSnapshot(node string) (cache.ResourceSnapshot, error) {
+	return c.inner.GetSnapshot(node)
+}
+
+func (c *endpointsCache) GetStatusKeys() []string {
+	return c.inner.GetStatusKeys()
+}
+
+func (c *endpointsCache) markSubscribed(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	c.logMu.Lock()
+	newSubscription := false
+	for _, n := range names {
+		if _, exists := c.subscribed[n]; !exists {
+			c.subscribed[n] = struct{}{}
+			newSubscription = true
+		}
+	}
+	c.logMu.Unlock()
+
+	// If we already have a subscription then we've already logged the backends.
+	if !newSubscription {
+		return
+	}
+
+	// Otherwise dump the current backend set.
+
+	c.mu.Lock()
+	resources := c.resourcesByType
+	c.mu.Unlock()
+	if resources != nil {
+		c.logBackendChanges(resources)
+	}
+}
+
+// logBackendChanges logs backend changes for subscribed clusters.
+// Logs are only emitted if the backend set has changed.
+func (c *endpointsCache) logBackendChanges(resourcesByType map[string][]types.Resource) {
+	eps := resourcesByType[resource.EndpointType]
+	byName := make(map[string]*endpointv3.ClusterLoadAssignment, len(eps))
+	for _, r := range eps {
+		if cla, ok := r.(*endpointv3.ClusterLoadAssignment); ok {
+			byName[cla.GetClusterName()] = cla
+		}
+	}
+
+	c.logMu.Lock()
+	defer c.logMu.Unlock()
+
+	for name := range c.subscribed {
+		desc := "(no endpoints)"
+		if cla, ok := byName[name]; ok {
+			desc = backendDescription(cla)
+		}
+		if prev := c.lastBackends[name]; prev == desc {
+			continue
+		}
+		c.lastBackends[name] = desc
+		klog.InfoS("endpoint set changed", "cluster", name, "backends", desc)
+	}
+}
+
+// backendDescription returns a deterministic one-line summary of a CLA's
+// endpoint set, grouped by locality:
+//
+//	"[zone/sub_zone] addr:port(hostname),addr:port(hostname) [zone2] addr:port"
+func backendDescription(cla *endpointv3.ClusterLoadAssignment) string {
+	byLoc := map[string][]string{}
+	for _, g := range cla.GetEndpoints() {
+		loc := formatLocality(g.GetLocality())
+		for _, lbe := range g.GetLbEndpoints() {
+			ep := lbe.GetEndpoint()
+			sock := ep.GetAddress().GetSocketAddress()
+			entry := fmt.Sprintf("%s:%d", sock.GetAddress(), sock.GetPortValue())
+			if host := ep.GetHostname(); host != "" {
+				entry = fmt.Sprintf("%s(%s)", entry, host)
+			}
+			byLoc[loc] = append(byLoc[loc], entry)
+		}
+	}
+	locs := make([]string, 0, len(byLoc))
+	for loc := range byLoc {
+		locs = append(locs, loc)
+	}
+	slices.Sort(locs)
+	parts := make([]string, 0, len(locs))
+	for _, loc := range locs {
+		addrs := byLoc[loc]
+		slices.Sort(addrs)
+		parts = append(parts, fmt.Sprintf("[%s] %s", loc, strings.Join(addrs, ",")))
+	}
+	return strings.Join(parts, " ")
+}
+
+func formatLocality(loc *corev3.Locality) string {
+	if loc == nil {
+		return "-"
+	}
+	z, sz := loc.GetZone(), loc.GetSubZone()
+	switch {
+	case z == "" && sz == "":
+		return "-"
+	case sz == "":
+		return z
+	default:
+		return z + "/" + sz
+	}
 }
