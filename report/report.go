@@ -124,16 +124,14 @@ func (s *server) recordStats(ctx context.Context, node *corev3.Node, request *lo
 			dst := locStats.GetLocality()
 			dstZone := dst.GetZone()
 			dstSubZone := dst.GetSubZone()
-			crossZone := sourceZone != "" && dstZone != "" && sourceZone != dstZone
-			crossSubZone := sourceSubZone != "" && dstSubZone != "" && sourceSubZone != dstSubZone
 			attrs := metric.WithAttributes(
 				attribute.String("cluster", clusterName),
 				attribute.String("source_zone", sourceZone),
 				attribute.String("source_sub_zone", sourceSubZone),
 				attribute.String("destination_zone", dstZone),
 				attribute.String("destination_sub_zone", dstSubZone),
-				attribute.Bool("cross_zone", crossZone),
-				attribute.Bool("cross_sub_zone", crossSubZone),
+				attribute.String("cross_zone", crossLocality(sourceZone, dstZone)),
+				attribute.String("cross_sub_zone", crossLocality(sourceSubZone, dstSubZone)),
 			)
 
 			if locStats.TotalSuccessfulRequests > 0 {
@@ -192,4 +190,18 @@ func WithStatsIntervalInSeconds(statsIntervalInSeconds int64) Option {
 	return func(s *server) {
 		s.statsIntervalInSeconds = statsIntervalInSeconds
 	}
+}
+
+// crossLocality returns a metric value to indicate whether src and dst match.
+// If either src or dst is not populated, we can't know whether the traffic
+// is crossing localities. In that case we populate the value with "unknown" to
+// avoid incorrectly flagging that traffic as cross-locality.
+func crossLocality(src, dst string) string {
+	if src == "" || dst == "" {
+		return "unknown"
+	}
+	if src != dst {
+		return "true"
+	}
+	return "false"
 }
