@@ -12,7 +12,9 @@ import (
 	"github.com/wongnai/xds/meter"
 	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/errgroup"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+	k8scache "k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 )
 
@@ -47,20 +49,34 @@ type Snapshotter struct {
 
 	client         kubernetes.Interface
 	servicesCache  cache.SnapshotCache
-	endpointsCache cache.SnapshotCache
+	endpointsCache *endpointsCache
 	muxCache       cache.MuxCache
 
-	endpointResourceCache   map[string]endpointCacheItem
+	nodeLocality *nodeLocalityStore
+
+	endpointResourceCache map[string]endpointCacheItem
+
 	resourcesByTypeLock     sync.RWMutex
 	serviceResourcesByType  map[string][]types.Resource
 	endpointResourcesByType map[string][]types.Resource
 	apiGatewayStats         map[string]int
 	kubeEventCounter        metric.Int64Counter
+
+	// serviceStore is captured at informer start so other code paths
+	// (e.g. per-endpoint locality lookups) can consult Service objects.
+	serviceStore k8scache.Store
+
+	emitMu          sync.Mutex
+	emitEndpointsFn func()
 }
 
-func New(client kubernetes.Interface) *Snapshotter {
+// SubZoneLabel selects the Kubernetes node label used as sub-zone for the
+// sub_zone-preference locality mode. Empty = use DefaultSubZoneLabel.
+type SubZoneLabel string
+
+func New(client kubernetes.Interface, subZoneLabel SubZoneLabel) *Snapshotter {
 	servicesCache := cache.NewSnapshotCache(false, EmptyNodeID{}, Logger)
-	endpointsCache := cache.NewSnapshotCache(false, EmptyNodeID{}, Logger)
+	endpointsCache := newEndpointsCache()
 	muxCache := cache.MuxCache{
 		Classify: func(r *cache.Request) string {
 			return mapTypeURL(r.TypeUrl)
@@ -81,6 +97,8 @@ func New(client kubernetes.Interface) *Snapshotter {
 		servicesCache:  servicesCache,
 		endpointsCache: endpointsCache,
 		muxCache:       muxCache,
+
+		nodeLocality: newNodeLocalityStore(string(subZoneLabel)),
 
 		endpointResourceCache: map[string]endpointCacheItem{},
 	}
@@ -105,7 +123,39 @@ func (s *Snapshotter) Start(stopCtx context.Context) error {
 	group.Go(func() error {
 		return s.startEndpoints(groupCtx)
 	})
+	group.Go(func() error {
+		return s.startNodes(groupCtx)
+	})
 	return group.Wait()
+}
+
+// triggerEndpointsEmit runs the endpoints emit pipeline under a mutex so
+// concurrent triggers from multiple informers don't race on the shared
+// endpointResourceCache and the emit closure's snapshot-hash state.
+func (s *Snapshotter) triggerEndpointsEmit() {
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	if s.emitEndpointsFn != nil {
+		s.emitEndpointsFn()
+	}
+}
+
+// localityModeFor reads the Service object behind a namespace/name and
+// returns its configured locality mode. Returns LocalityNone if the
+// service is not yet known.
+func (s *Snapshotter) localityModeFor(namespace, name string) LocalityMode {
+	if s.serviceStore == nil {
+		return LocalityNone
+	}
+	obj, exists, err := s.serviceStore.GetByKey(namespace + "/" + name)
+	if err != nil || !exists {
+		return LocalityNone
+	}
+	svc, ok := obj.(*corev1.Service)
+	if !ok {
+		return LocalityNone
+	}
+	return localityModeFromService(svc)
 }
 
 func (s *Snapshotter) snapshotResourceGaugeCallback(_ context.Context, result metric.Int64Observer) error {

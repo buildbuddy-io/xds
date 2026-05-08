@@ -10,6 +10,7 @@ import (
 
 	"github.com/wongnai/xds/internal/di"
 	"github.com/wongnai/xds/meter"
+	"github.com/wongnai/xds/snapshot"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 	"k8s.io/klog/v2"
 )
@@ -19,13 +20,15 @@ func main() {
 
 	var statsIntervalInSeconds int64
 	flag.CommandLine.Int64Var(&statsIntervalInSeconds, "statsinterval", 300, "stats update interval in seconds")
+	subZoneLabel := flag.String("sub-zone-label", snapshot.DefaultSubZoneLabel,
+		"Kubernetes node label read as sub-zone when a Service requests sub_zone locality")
 	flag.Parse()
 
 	ctx := context.Background()
 
 	meter.InstallPromExporter()
 
-	servers, stop, err := di.InitializeServer(context.Background(), statsIntervalInSeconds)
+	servers, stop, err := di.InitializeServer(context.Background(), statsIntervalInSeconds, snapshot.SubZoneLabel(*subZoneLabel))
 	if err != nil {
 		klog.Fatal(err)
 	}

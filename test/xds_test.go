@@ -30,7 +30,7 @@ func (s *XdsSuite) SetupTest() {
 	var err error
 	s.kube = fake.NewClientset()
 	s.conn = bufconn.Listen(1)
-	s.TestServer, s.stop, err = di.InitializeTestServer(s.T().Context(), s.kube, 1)
+	s.TestServer, s.stop, err = di.InitializeTestServer(s.T().Context(), s.kube, 1, "")
 	s.Require().NoError(err)
 
 	go s.TestServer.GrpcServer.Serve(s.conn)

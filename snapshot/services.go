@@ -35,7 +35,13 @@ func (s *Snapshotter) startServices(ctx context.Context) error {
 
 	store := k8scache.NewUndeltaStore(func(v []interface{}) {
 		emit()
+		// A service's locality-preference annotation affects how its
+		// endpoints are split into LocalityLbEndpoints, so any service
+		// change requires re-emitting endpoints. The endpoint emit path
+		// dedups via its own hash.
+		s.triggerEndpointsEmit()
 	}, k8scache.DeletionHandlingMetaNamespaceKeyFunc)
+	s.serviceStore = store
 
 	reflector := k8scache.NewReflector(&k8scache.ListWatch{
 		ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {

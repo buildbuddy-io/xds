@@ -3,13 +3,14 @@ package snapshot
 import (
 	"context"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
+	"strings"
 
 	"github.com/ccoveille/go-safecast/v2"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
-	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"github.com/wongnai/xds/meter"
 	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -22,15 +23,15 @@ import (
 )
 
 type endpointCacheItem struct {
-	version   string
-	resources []types.Resource
+	version     string
+	nodeVersion uint64
+	mode        LocalityMode
+	resources   []types.Resource
 }
 
 func (s *Snapshotter) startEndpoints(ctx context.Context) error {
-	emit := func() {}
-
 	store := k8scache.NewUndeltaStore(func(v []interface{}) {
-		emit()
+		s.triggerEndpointsEmit()
 	}, k8scache.DeletionHandlingMetaNamespaceKeyFunc)
 
 	reflector := k8scache.NewReflector(&k8scache.ListWatch{
@@ -44,7 +45,7 @@ func (s *Snapshotter) startEndpoints(ctx context.Context) error {
 
 	var lastSnapshotHash uint64
 
-	emit = func() {
+	emit := func() {
 		version := reflector.LastSyncResourceVersion()
 		s.kubeEventCounter.Add(ctx, 1, metric.WithAttributes(meter.ResourceAttrKey.String("endpoints")))
 
@@ -53,7 +54,7 @@ func (s *Snapshotter) startEndpoints(ctx context.Context) error {
 		hash, err := resourcesHash(endpointsResources)
 		if err == nil {
 			if hash == lastSnapshotHash {
-				klog.V(5).Info("new snapshot is equivalent to the previous one")
+				klog.V(5).Info("new endpoints snapshot is equivalent to the previous one")
 				return
 			}
 			lastSnapshotHash = hash
@@ -64,13 +65,11 @@ func (s *Snapshotter) startEndpoints(ctx context.Context) error {
 		resourcesByType := resourcesToMap(endpointsResources)
 		s.setEndpointResourcesByType(resourcesByType)
 
-		snapshot, err := cache.NewSnapshot(version, resourcesByType)
-		if err != nil {
-			panic(err)
-		}
-
-		s.endpointsCache.SetSnapshot(ctx, "", snapshot)
+		s.endpointsCache.setResources(ctx, version, resourcesByType)
 	}
+	s.emitMu.Lock()
+	s.emitEndpointsFn = emit
+	s.emitMu.Unlock()
 
 	reflector.Run(ctx.Done())
 	return nil
@@ -101,7 +100,14 @@ func (s *Snapshotter) kubeEndpointToResources(ep *corev1.Endpoints) []types.Reso
 		klog.Errorf("fail to get object key: %s", err)
 		return nil
 	}
-	if val, ok := s.endpointResourceCache[name]; ok && val.version == ep.ResourceVersion {
+
+	mode := s.localityModeFor(ep.Namespace, ep.Name)
+	nodeVersion := s.nodeLocality.getVersion()
+
+	if val, ok := s.endpointResourceCache[name]; ok &&
+		val.version == ep.ResourceVersion &&
+		val.nodeVersion == nodeVersion &&
+		val.mode == mode {
 		return val.resources
 	}
 
@@ -109,31 +115,25 @@ func (s *Snapshotter) kubeEndpointToResources(ep *corev1.Endpoints) []types.Reso
 
 	for _, subset := range ep.Subsets {
 		for _, port := range subset.Ports {
-			var portName string
+			var clusterName string
 			if port.Name == "" {
-				portName = fmt.Sprintf("%s.%s:%d", ep.Name, ep.Namespace, port.Port)
+				clusterName = fmt.Sprintf("%s.%s:%d", ep.Name, ep.Namespace, port.Port)
 			} else {
-				portName = fmt.Sprintf("%s.%s:%s", ep.Name, ep.Namespace, port.Name)
+				clusterName = fmt.Sprintf("%s.%s:%s", ep.Name, ep.Namespace, port.Name)
 			}
 
 			cla := &endpointv3.ClusterLoadAssignment{
-				ClusterName: portName,
-				Endpoints: []*endpointv3.LocalityLbEndpoints{
-					{
-						LoadBalancingWeight: wrapperspb.UInt32(1),
-						Locality:            &corev3.Locality{},
-						LbEndpoints:         []*endpointv3.LbEndpoint{},
-					},
-				},
+				ClusterName: clusterName,
 			}
 			out = append(out, cla)
 
-			sortedAddresses := subset.Addresses
-			sort.SliceStable(sortedAddresses, func(i, j int) bool {
-				l := sortedAddresses[i].IP
-				r := sortedAddresses[j].IP
-				return l < r
+			sortedAddresses := slices.Clone(subset.Addresses)
+			slices.SortStableFunc(sortedAddresses, func(a, b corev1.EndpointAddress) int {
+				return strings.Compare(a.IP, b.IP)
 			})
+
+			portU32 := safecast.MustConvert[uint32](port.Port)
+			groups := map[string]*endpointv3.LocalityLbEndpoints{}
 
 			for _, addr := range sortedAddresses {
 				hostname := addr.Hostname
@@ -143,9 +143,18 @@ func (s *Snapshotter) kubeEndpointToResources(ep *corev1.Endpoints) []types.Reso
 				if hostname == "" && addr.NodeName != nil {
 					hostname = *addr.NodeName
 				}
-				portU32 := safecast.MustConvert[uint32](port.Port)
 
-				cla.Endpoints[0].LbEndpoints = append(cla.Endpoints[0].LbEndpoints, &endpointv3.LbEndpoint{
+				loc := s.localityForAddress(addr, mode)
+				key := loc.GetZone() + localityKeySep + loc.GetSubZone()
+				g, ok := groups[key]
+				if !ok {
+					g = &endpointv3.LocalityLbEndpoints{
+						Locality:            loc,
+						LoadBalancingWeight: wrapperspb.UInt32(1),
+					}
+					groups[key] = g
+				}
+				g.LbEndpoints = append(g.LbEndpoints, &endpointv3.LbEndpoint{
 					HostIdentifier: &endpointv3.LbEndpoint_Endpoint{
 						Endpoint: &endpointv3.Endpoint{
 							Address: &corev3.Address{
@@ -164,13 +173,37 @@ func (s *Snapshotter) kubeEndpointToResources(ep *corev1.Endpoints) []types.Reso
 					},
 				})
 			}
+
+			// Emit in sorted locality-key order so hash is stable.
+			for _, k := range slices.Sorted(maps.Keys(groups)) {
+				cla.Endpoints = append(cla.Endpoints, groups[k])
+			}
 		}
 	}
 
 	s.endpointResourceCache[name] = endpointCacheItem{
-		version:   ep.ResourceVersion,
-		resources: out,
+		version:     ep.ResourceVersion,
+		nodeVersion: nodeVersion,
+		mode:        mode,
+		resources:   out,
 	}
 
 	return out
+}
+
+// localityForAddress builds the Locality for a single endpoint
+// address according to the service's locality mode.
+func (s *Snapshotter) localityForAddress(addr corev1.EndpointAddress, mode LocalityMode) *corev3.Locality {
+	if mode == LocalityNone || addr.NodeName == nil {
+		return &corev3.Locality{}
+	}
+	info := s.nodeLocality.get(*addr.NodeName)
+	switch mode {
+	case LocalityZone:
+		return &corev3.Locality{Zone: info.zone}
+	case LocalitySubZone:
+		return &corev3.Locality{Zone: info.zone, SubZone: info.subZone}
+	default:
+		return &corev3.Locality{}
+	}
 }
