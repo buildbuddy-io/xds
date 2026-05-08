@@ -2,6 +2,7 @@ package debug
 
 import (
 	"encoding/json"
+	"slices"
 
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
@@ -13,23 +14,32 @@ type cacheMarshaler struct {
 	cache.Cache
 }
 
+// minimal interface for reading data out of caches.
+type snapshotReader interface {
+	GetSnapshot(node string) (cache.ResourceSnapshot, error)
+	GetStatusKeys() []string
+}
+
 func (c cacheMarshaler) MarshalJSON() ([]byte, error) {
-	snapshotCache, ok := c.Cache.(cache.SnapshotCache)
+	reader, ok := c.Cache.(snapshotReader)
 	if !ok {
 		return nil, nil
 	}
 
+	nodes := reader.GetStatusKeys()
+	// Include the default snapshot as it can be setup before any subscriptions.
+	if !slices.Contains(nodes, "") {
+		nodes = append(nodes, "")
+	}
+
 	out := map[string]map[resource.Type]interface{}{}
-	nodes := []string{""} // TODO: how do i not hardcode this...
-
 	for _, node := range nodes {
-		snapshot, err := snapshotCache.GetSnapshot(node)
+		snapshot, err := reader.GetSnapshot(node)
 		if err != nil {
-			return nil, err
+			continue
 		}
-		nodeMap := map[resource.Type]interface{}{}
-		out[node] = nodeMap
 
+		nodeMap := map[resource.Type]interface{}{}
 		for i := types.ResponseType(0); i < types.UnknownType; i++ {
 			typeURL, _ := cache.GetResponseTypeURL(i)
 			version := snapshot.GetVersion(typeURL)
@@ -43,6 +53,9 @@ func (c cacheMarshaler) MarshalJSON() ([]byte, error) {
 				version:   version,
 				resources: resources,
 			}
+		}
+		if len(nodeMap) > 0 {
+			out[node] = nodeMap
 		}
 	}
 
