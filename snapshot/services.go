@@ -169,6 +169,12 @@ func kubeServicesToResources(services []*corev1.Service) []types.Resource {
 						},
 					},
 				},
+				// Opt this cluster into LRS, reporting to the same xDS server.
+				LrsServer: &corev3.ConfigSource{
+					ConfigSourceSpecifier: &corev3.ConfigSource_Self{
+						Self: &corev3.SelfConfigSource{},
+					},
+				},
 				// Allow more concurrent requests.
 				// The default limit is 1024 if this value not included in the policy.
 				// TODO: make this configurable
