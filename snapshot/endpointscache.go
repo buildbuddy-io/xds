@@ -3,6 +3,7 @@ package snapshot
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -300,11 +301,7 @@ func backendDescription(cla *endpointv3.ClusterLoadAssignment) string {
 			byLoc[loc] = append(byLoc[loc], entry)
 		}
 	}
-	locs := make([]string, 0, len(byLoc))
-	for loc := range byLoc {
-		locs = append(locs, loc)
-	}
-	slices.Sort(locs)
+	locs := slices.Sorted(maps.Keys(byLoc))
 	parts := make([]string, 0, len(locs))
 	for _, loc := range locs {
 		addrs := byLoc[loc]
